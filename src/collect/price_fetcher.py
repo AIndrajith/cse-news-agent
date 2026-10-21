@@ -56,9 +56,10 @@ class PriceFetcher:
         resp.raise_for_status()
         return resp.json()
 
-    def fetch_market_summary(self) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    def fetch_market_summary(self) -> Tuple[str, Dict[str, Any], Any]:
         """
         Fetches dailyMarketSummery.
+        Unwraps nested list layers ([[ { ... } ]]) returned by CSE.
         Returns:
             trade_date (YYYY-MM-DD),
             parsed market data dict,
@@ -66,33 +67,50 @@ class PriceFetcher:
         """
         raw_data = self._post("dailyMarketSummery")
 
-        # tradeDate in millisecond timestamp representing Sri Lanka trade day
-        raw_trade_date = raw_data.get("tradeDate")
+        # Unwrap nested lists until we reach the dictionary payload
+        item = raw_data
+        while isinstance(item, list):
+            if not item:
+                raise ValueError("Endpoint dailyMarketSummery returned an empty list")
+            item = item[0]
+
+        if not isinstance(item, dict):
+            raise TypeError(f"Unexpected response structure from dailyMarketSummery: {type(item)}")
+
+        raw_trade_date = item.get("tradeDate")
         if not raw_trade_date:
-            raise ValueError("Endpoint dailyMarketSummery did not return 'tradeDate'")
+            raise ValueError(f"Endpoint dailyMarketSummery item missing 'tradeDate': {item}")
 
         trade_date = parse_cse_timestamp(int(raw_trade_date))
 
         market_record = {
             "trade_date": trade_date,
-            "aspi": float(raw_data.get("asi", 0.0) or 0.0),
-            "snp_sl20": float(raw_data.get("spp", 0.0) or 0.0),
-            "market_turnover": float(raw_data.get("marketTurnover", 0.0) or 0.0),
-            "market_cap": float(raw_data.get("marketCap", 0.0) or 0.0),
-            "companies_traded": int(raw_data.get("tradeCompanyNumber", 0) or 0),
+            "aspi": float(item.get("asi", 0.0) or 0.0),
+            "snp_sl20": float(item.get("spp", 0.0) or 0.0),
+            "market_turnover": float(item.get("marketTurnover", 0.0) or 0.0),
+            "market_cap": float(item.get("marketCap", 0.0) or 0.0),
+            "companies_traded": int(item.get("tradeCompanyNumber", 0) or 0),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
         return trade_date, market_record, raw_data
 
-    def fetch_detailed_trades(self, trade_date: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    def fetch_detailed_trades(self, trade_date: str) -> Tuple[List[Dict[str, Any]], Any]:
         """
         Fetches detailedTrades for all listed companies.
+        Handles both direct list responses and dictionary wrappers.
         Returns:
             list of parsed price records,
             raw JSON response.
         """
         raw_data = self._post("detailedTrades")
-        items = raw_data.get("reqDetailTrades", [])
+
+        if isinstance(raw_data, list):
+            items = raw_data
+        elif isinstance(raw_data, dict):
+            items = raw_data.get("reqDetailTrades") or raw_data.get("reqTradeSummery") or []
+        else:
+            items = []
+
         records = []
         now_utc = datetime.now(timezone.utc).isoformat()
 
@@ -103,8 +121,6 @@ class PriceFetcher:
 
             price = float(row.get("price", 0.0) or 0.0)
             qty = float(row.get("qty", 0.0) or 0.0)
-
-            # Note: turnover is calculated from price * qty for detailedTrades fallback
             turnover = float(row.get("turnover", price * qty) or 0.0)
 
             records.append({
