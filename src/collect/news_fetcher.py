@@ -1,6 +1,6 @@
 """
 News Fetcher for CSE News Agent.
-Reads RSS feeds defined in data/sources.yaml and stores new raw articles in SQLite.
+Reads RSS feeds defined in data/sources.yaml (or .yml) and stores new raw articles in SQLite.
 """
 
 from datetime import datetime, timezone
@@ -11,11 +11,29 @@ from typing import Any, Dict, List
 import feedparser
 import yaml
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.pretty import pprint as rpprint
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.table import Table
+
 logger = logging.getLogger(__name__)
+console = Console()
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = BASE_DIR / "data" / "cse.db"
-DEFAULT_SOURCES_PATH = BASE_DIR / "data" / "sources.yaml"
+
+
+def resolve_default_sources_path() -> Path:
+    """Checks for sources.yaml first, then falls back to sources.yml."""
+    yaml_path = BASE_DIR / "data" / "sources.yaml"
+    yml_path = BASE_DIR / "data" / "sources.yml"
+    if yml_path.exists() and not yaml_path.exists():
+        return yml_path
+    return yaml_path
+
+
+DEFAULT_SOURCES_PATH = resolve_default_sources_path()
 
 
 def load_sources(sources_path: Path = DEFAULT_SOURCES_PATH) -> List[Dict[str, Any]]:
@@ -36,7 +54,6 @@ class NewsFetcher:
         """Parses an RSS feed and returns structured article entries."""
         name = source["name"]
         url = source["url"]
-        logger.info(f"Checking feed: {name} ({url})")
 
         feed = feedparser.parse(url)
         if feed.bozo and not feed.entries:
@@ -52,14 +69,12 @@ class NewsFetcher:
             if not link or not title:
                 continue
 
-            # Fallback published timestamp resolution
             published_at = getattr(entry, "published", "") or getattr(entry, "updated", "")
             if not published_at and hasattr(entry, "published_parsed") and entry.published_parsed:
                 published_at = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).isoformat()
             if not published_at:
                 published_at = now_utc
 
-            # Store the preliminary description/summary; full body will be cleaned in cleaner.py
             raw_content = getattr(entry, "summary", "") or getattr(entry, "description", "")
 
             articles.append({
@@ -104,7 +119,6 @@ class NewsFetcher:
                 if cur.rowcount > 0:
                     new_count += 1
 
-            # Log execution stats
             cur.execute(
                 """
                 INSERT INTO fetch_log (source, status, records_fetched, message, fetched_at)
@@ -127,22 +141,58 @@ class NewsFetcher:
 
         return new_count
 
-    def run(self) -> int:
+    def run(self, show_output: bool = False) -> int:
         """Reads all sources and inserts new articles."""
-        sources = load_sources(self.sources_path)
-        all_articles = []
+        sources = [s for s in load_sources(self.sources_path) if s.get("type") == "rss"]
+        all_articles: List[Dict[str, str]] = []
+        source_stats: List[Dict[str, Any]] = []
 
-        for src in sources:
-            if src.get("type") == "rss":
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            disable=not show_output,
+        ) as progress:
+            task = progress.add_task("[cyan]Downloading RSS feeds...", total=len(sources))
+
+            for src in sources:
+                progress.update(task, description=f"[cyan]Fetching {src['name']}...")
                 articles = self.fetch_feed(src)
                 all_articles.extend(articles)
+                source_stats.append({
+                    "name": src["name"],
+                    "url": src["url"],
+                    "fetched": len(articles),
+                })
+                progress.advance(task)
 
         inserted_count = self.save_articles(all_articles)
-        logger.info(f"Done. Collected {len(all_articles)} total items, {inserted_count} new entries saved.")
+
+        if show_output:
+            table = Table(title="RSS Feed Collection Summary")
+            table.add_column("Source Name", style="bold cyan")
+            table.add_column("Feed URL", style="dim")
+            table.add_column("Articles Found", justify="right", style="green")
+
+            for stat in source_stats:
+                table.add_row(stat["name"], stat["url"], str(stat["fetched"]))
+
+            console.print(table)
+
+            if all_articles:
+                console.print("\n[bold cyan]Sample Fetched Articles (pprint preview):[/bold cyan]")
+                rpprint(all_articles, max_length=2, max_string=80, expand_all=True)
+
+            console.print(
+                f"\n[bold green]✔ Total parsed: {len(all_articles)} | New articles inserted: {inserted_count}[/bold green]"
+            )
+
         return inserted_count
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    console.print(Panel.fit("[bold white]CSE Financial News Collector[/bold white]", border_style="cyan"))
     fetcher = NewsFetcher()
-    fetcher.run()
+    fetcher.run(show_output=True)

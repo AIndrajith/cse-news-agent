@@ -12,8 +12,15 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 import requests
+from rich import console
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.pretty import pprint as rpprint
+from rich.table import Table
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 # Sri Lanka Standard Time: UTC+05:30
 SL_TZ = timezone(timedelta(hours=5, minutes=30))
@@ -222,11 +229,46 @@ class PriceFetcher:
         finally:
             conn.close()
 
-    def run(self) -> str:
+    def _display_summary(self, market_record: Dict[str, Any], price_records: List[Dict[str, Any]]) -> None:
+        """prints a formatted summary and top trades table to the terminal"""
+        console.print("\n[bold cyan]Market Summary (pprint):[/bold cyan]")
+        rpprint(market_record, expand_all=True)
+
+        if not price_records:
+            return
+
+        # Sort by turnover descending and show top 5
+        top_traders = sorted(price_records, key=lambda x:x["turnover"], reverse=True)[:5]
+
+        table = Table(title=f"Top 5 Traded Companies ({market_record['trade_date']}")
+        table.add_column("Symbol", style="bold cyan")
+        table.add_column("Company", style="white")
+        table.add_column("Close (LKR)", justify="right", style="bold")
+        table.add_column("Change %", justify="right")
+        table.add_column("Volume", justify="right", style="dim")
+        table.add_column("Turnover (LKR)", justify="right", style="yellow")
+
+        for row in top_traders:
+            pct = row["change_pct"]
+            pct_str = f"[green]+{pct:.2f}%[/green]" if pct >= 0 else f"[red]{pct:.2f}%[/red]"
+            table.add_row(
+                row["symbol"],
+                row["company_name"][:28],
+                f"{row['close_price']:,.2f}",
+                pct_str,
+                f"{int(row['share_volume']):,}",
+                f"{row['turnover']:,.2f}",
+            )
+
+        console.print(table)
+
+    def run(self, show_output: bool = False) -> str:
         """Coordinates collection, raw snapshots, and database persistence."""
-        logger.info("Starting daily price fetch...")
-        trade_date, market_record, raw_market = self.fetch_market_summary()
-        price_records, raw_trades = self.fetch_detailed_trades(trade_date)
+        with console.status("[bold green]Fetching daily market summary from CSE...", spinner="dots"):
+            trade_date, market_record, raw_market = self.fetch_market_summary()
+
+        with console.status(f"[bold green]Fetching detailed trades for {trade_date}", spinner="dots"):
+            price_records, raw_trades = self.fetch_detailed_trades(trade_date)
 
         # Write audit snapshots
         save_raw_snapshot(self.snapshots_dir, f"{trade_date}_market_summary.json", raw_market)
@@ -234,15 +276,21 @@ class PriceFetcher:
 
         # Commit to database
         self.save_to_db(market_record, price_records)
-        logger.info(f"Successfully processed {len(price_records)} records for {trade_date}")
+
+        if show_output:
+            self._display_summary(market_record, price_records)
+            console.print(
+                f"\n[bold green]✔ Saved {len(price_records)} records for {trade_date} to SQLite & snapshots.[/bold green]"
+            )
+
         return trade_date
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    console.print(Panel.fit("[bold white] CSE Daily Price Collector[/bold white]", border_style="cyan"))
     base_dir = Path(__file__).resolve().parents[2]
     db_file = base_dir / "data" / "cse.db"
     snapshots_dir = base_dir / "data" / "snapshots"
 
     fetcher = PriceFetcher(db_path=db_file, snapshots_dir=snapshots_dir)
-    fetcher.run()
+    fetcher.run(show_output=True)
