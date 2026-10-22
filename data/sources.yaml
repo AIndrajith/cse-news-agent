@@ -1,0 +1,16 @@
+sources:
+  - name: "EconomyNext"
+    type: "rss"
+    url: "https://economynext.com/feed/"
+
+  - name: "Daily FT - Business"
+    type: "rss"
+    url: "https://www.ft.lk/rss/business-news/34"
+
+  - name: "Daily FT - Financial Services"
+    type: "rss"
+    url: "https://www.ft.lk/rss/financial-services/42"
+
+  - name: "Daily Mirror - Business"
+    type: "rss"
+    url: "https://www.dailymirror.lk/RSS_Feeds/business-news"
