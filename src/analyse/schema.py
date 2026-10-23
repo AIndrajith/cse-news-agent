@@ -40,7 +40,7 @@ class StoryClassification(BaseModel):
         )
     )
     sentiment_score: float = Field(
-        ge=1.0,
+        ge=-1.0,
         le=1.0,
         description=(
             "Score from -1.0 (very bad news for the sector) to +1.0 (very good news for the sector)."
