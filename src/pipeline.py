@@ -63,8 +63,8 @@ def run_daily_pipeline(
     # Step 3: understand the News (AI classifier)
     if show_output:
         console.rule("[bold white]Step 3: Classify stories (AI)[/bold white]")
-    classifer = StoryClassifier(db_path=db_path)
-    classifer.run(show_output=show_output)
+    classifier = StoryClassifier(db_path=db_path)
+    classifier.run(show_output=show_output)
 
     # Step 4: Score Each Sector (Plain maths)
     if show_output:
