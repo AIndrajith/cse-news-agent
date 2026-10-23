@@ -3,7 +3,7 @@ AI Story Classifier for CSE News Agent.
 Reads deduplicated stories from SQLite, asks the LLM to classify each story
 using the Pydantic StoryClassification schema, and stores the results.
 """
-
+import time
 from datetime import datetime, timezone
 import logging
 import os
@@ -161,21 +161,37 @@ class StoryClassifier:
             f"Body: {(clean_text or '')[:2500]}"
         )
 
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema=StoryClassification,
-                temperature=0.0,  # 0.0 for deterministic, repeatable outputs
-            ),
-        )
+        max_retries = 4
+        base_delay = 3.0
 
-        if response.parsed and isinstance(response.parsed, StoryClassification):
-            return response.parsed
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        response_schema=StoryClassification,
+                        temperature=0.0,  # 0.0 for deterministic, repeatable outputs
+                    ),
+                )
 
-        return StoryClassification.model_validate_json(response.text)
+                if response.parsed and isinstance(response.parsed, StoryClassification):
+                    return response.parsed
+
+                return StoryClassification.model_validate_json(response.text)
+
+            except Exception as e:
+                # Check server availability error
+                error_str = str(e)
+                if "503" in error_str or "UNAVAILABLE" in error_str or "high demand" in error_str:
+                    if attempt < max_retries - 1:
+                        sleep_time = base_delay * (2 ** attempt)
+                        logger.warning(f"Model busy (503). Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(sleep_time)
+                        continue
+                raise e
 
     def save_classification(self, article_id: int, result: StoryClassification) -> None:
         """Saves a single validated StoryClassification into SQLite."""
