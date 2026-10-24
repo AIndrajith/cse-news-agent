@@ -12,9 +12,11 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
+import anthropic
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from openai import OpenAI
 
 from rich.console import Console
 from rich.panel import Panel
@@ -39,41 +41,69 @@ Rules:
 2. Assign the single best CSE sector. Use 'Market-Wide' for Central Bank (CBSL) interest rates, inflation, IMF, taxes, or LKR exchange rates. Use 'Unrelated' for non-business news.
 3. Score sentiment from -1.0 (very negative) to +1.0 (very positive).
 4. Set is_new=False if the story repeats an event in RECENT HEADLINES.
-5. Provide one concise sentence for 'reasoning' and one concise sentence for 'counter_argument'.
-6. Set confidence to 'LOW', 'MEDIUM', or 'HIGH'.
+5. 'reasoning' MUST be ONE sentence and MUST be 200 characters or fewer.
+6. 'counter_argument' MUST be ONE sentence and MUST be 200 characters or fewer.
+7. Never exceed these character limits. Be concise.
+8. Set confidence to 'LOW', 'MEDIUM', or 'HIGH'.
 """
 
+# ================================
+# CHOOSE THE API PROVIDER ("gemini", "anthropic", or "openrouter")
+# ================================
+AI_PROVIDER = "openrouter"
+
+# Model configurations
+GEMINI_MODEL = "gemini-3.8-flash"
+ANTHROPIC_MODEL = "claude-3-5-haiku-20241022"
+OPENROUTER_MODEL = "nvidia/nemotron-3.5-lightning:free"
 
 class StoryClassifier:
     def __init__(
         self,
         db_path: Path = DEFAULT_DB_PATH,
-        model_name: str = "gemini-3.1-flash",
-        fallback_model: str = "gemini-2.5-flash-lite",
         api_key: Optional[str] = None,
         request_delay: float = 2.0,
     ):
         self.db_path = Path(db_path)
-        self.model_name = model_name
-        self.fallback_model = fallback_model
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.request_delay = request_delay
+        self.api_key=api_key
         self._client = None
         self._ensure_schema()
 
     @property
-    def client(self) -> genai.Client:
-        """Lazily initializes the Gemini client with a strict 30-second HTTP timeout."""
+    def client(self) -> Any:
+        """Lazily initializes the correct API client based on AI_PROVIDER"""
         if self._client is None:
-            if not self.api_key:
-                raise ValueError(
-                    "GEMINI_API_KEY is missing. Add it to your .env file or pass api_key to StoryClassifier."
+            if AI_PROVIDER == "gemini":
+                key = self.api_key or os.getenv("GEMINI_API_KEY")
+                if not key:
+                    raise ValueError("GEMINI_API_KEY is missing in your .env file.")
+                self._client = genai.Client(
+                    api_key=key,
+                    http_options=types.HttpOptions(timeout=30000)
                 )
-            # timeout is in milliseconds (30,000 ms = 30 seconds) so a hung connection never freezes
-            self._client = genai.Client(
-                api_key=self.api_key,
-                http_options=types.HttpOptions(timeout=30000),
-            )
+
+            elif AI_PROVIDER == "anthropic":
+                key = self.api_key or os.getenv("ANTHROPIC_API_KEY")
+                if not key:
+                    raise ValueError("ANTHROPIC_API_KEY is missing in your .env file.")
+                self._client = anthropic.Anthropic(
+                    api_key=key,
+                    timeout=30.0
+                )
+
+            elif AI_PROVIDER == "openrouter":
+                key = self.api_key or os.getenv("OPENROUTER_API_KEY")
+                if not key:
+                    raise ValueError("OPENROUTER_API_KEY is missing in your .env file.")
+                self._client = OpenAI(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=key,
+                    timeout=30.0
+                )
+
+            else:
+                raise ValueError(f"Invalid AI_PROVIDER: {AI_PROVIDER}")
         return self._client
 
     def _ensure_schema(self) -> None:
@@ -187,25 +217,90 @@ class StoryClassifier:
         base_delay = 4.0
 
         for attempt in range(max_retries):
-            # Switch to fallback model if primary model is overloaded on retry
-            active_model = self.model_name if attempt < 2 else self.fallback_model
             try:
-                response = self.client.models.generate_content(
-                    model=active_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        response_mime_type="application/json",
-                        response_schema=StoryClassification,
+                if AI_PROVIDER == "gemini":
+                    response = self.client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            response_mime_type="application/json",
+                            response_schema=StoryClassification,
+                            temperature=0.0,
+                            thinking_config=types.ThinkingConfig(thinking_budget=0)
+                        ),
+                    )
+                    if response.parsed and isinstance(response.parsed, StoryClassification):
+                        return response.parsed
+                    raw_text = response.text
+
+                elif AI_PROVIDER == "anthropic":
+                    message = self.client.messages.create(
+                        model=ANTHROPIC_MODEL,
+                        max_tokens=600,
+                        system=SYSTEM_PROMPT,
+                        messages=[{"role":"user", "content":prompt}],
+                        temperature=0.0
+                    )
+                    raw_text = message.content[0].text
+
+
+                elif AI_PROVIDER == "openrouter":
+                    schema = StoryClassification.model_json_schema()
+                    response = self.client.chat.completions.create(
+                        model=OPENROUTER_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": f"""
+                                    {SYSTEM_PROMPT}
+                                    You MUST return a JSON object containing ALL of these fields:
+                                    1. sector
+                                    2. sentiment_score
+                                    3. importance
+                                    4. is_new
+                                    5. confidence
+                                    6. reasoning
+                                    7. counter_argument
+                                    Do not omit any field.
+                                    The JSON must conform to this schema:
+                                    {schema}
+                                    Example of the required structure:
+                                    {{
+                                        "sector": "Banks",
+                                        "sentiment_score": 0.50,
+                                        "importance": "moderate",
+                                        "is_new": true,
+                                        "confidence": "HIGH",
+                                        "reasoning": "The story directly affects banking sector conditions.",
+                                        "counter_argument": "The impact may be limited if the change is temporary."
+                                    }}
+                                    Return ONLY the JSON object.
+                                    Do not include markdown.
+                                    Do not include ```json.
+                                    Do not include explanations outside the JSON.
+                                    """
+                            },
+                            {
+                                "role": "user",
+                                "content": prompt
+                            }
+                        ],
                         temperature=0.0,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
+                        response_format={"type": "json_object"},
+                    )
+                    raw_text = response.choices[0].message.content
 
-                if response.parsed and isinstance(response.parsed, StoryClassification):
-                    return response.parsed
+                    # print("\n================ RAW OPENROUTER RESPONSE ================")
+                    # print(raw_text)
+                    # print("==========================================================\n")
 
-                return StoryClassification.model_validate_json(response.text)
+                else:
+                    raise ValueError(f"Unknown AI_PROVIDER : {AI_PROVIDER}")
+
+                print(f"{AI_PROVIDER} classification response received")
+
+                return StoryClassification.model_validate_json(raw_text)
 
             except Exception as e:
                 error_str = str(e).upper()
@@ -216,7 +311,7 @@ class StoryClassifier:
                 if is_transient and attempt < max_retries - 1:
                     sleep_time = base_delay * (attempt + 1)
                     console.print(
-                        f"[yellow]⚠ API busy ({active_model}). Retrying in {sleep_time:.0f}s "
+                        f"[yellow]⚠ API busy ({AI_PROVIDER}). Retrying in {sleep_time:.0f}s "
                         f"(Attempt {attempt + 1}/{max_retries})...[/yellow]"
                     )
                     time.sleep(sleep_time)

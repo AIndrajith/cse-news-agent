@@ -1,5 +1,5 @@
 """
-CSE News Analysis Agent Orchestrator (LangGrapht State Machine).
+CSE News Analysis Agent Orchestrator (LangGraph State Machine).
 An autonomous agentic loop that monitors database state, handles retries, and coordinates tools.
 """
 
