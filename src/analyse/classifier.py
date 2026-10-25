@@ -5,6 +5,7 @@ using the Pydantic StoryClassification schema, and stores the results.
 """
 
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
@@ -12,11 +13,8 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
-import anthropic
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from openai import OpenAI
+import httpx
 
 from rich.console import Console
 from rich.panel import Panel
@@ -53,9 +51,10 @@ Rules:
 AI_PROVIDER = "openrouter"
 
 # Model configurations
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 ANTHROPIC_MODEL = "claude-3-5-haiku-20241022"
 OPENROUTER_MODEL = "nvidia/nemotron-3.5-lightning:free"
+
 
 class StoryClassifier:
     def __init__(
@@ -66,15 +65,17 @@ class StoryClassifier:
     ):
         self.db_path = Path(db_path)
         self.request_delay = request_delay
-        self.api_key=api_key
+        self.api_key = api_key
         self._client = None
         self._ensure_schema()
 
     @property
     def client(self) -> Any:
-        """Lazily initializes the correct API client based on AI_PROVIDER"""
+        """Lazily initializes the API client without triggering jiter DLL imports."""
         if self._client is None:
             if AI_PROVIDER == "gemini":
+                from google import genai
+                from google.genai import types
                 key = self.api_key or os.getenv("GEMINI_API_KEY")
                 if not key:
                     raise ValueError("GEMINI_API_KEY is missing in your .env file.")
@@ -87,19 +88,27 @@ class StoryClassifier:
                 key = self.api_key or os.getenv("ANTHROPIC_API_KEY")
                 if not key:
                     raise ValueError("ANTHROPIC_API_KEY is missing in your .env file.")
-                self._client = anthropic.Anthropic(
-                    api_key=key,
-                    timeout=30.0
+                self._client = httpx.Client(
+                    base_url="https://api.anthropic.com/v1",
+                    headers={
+                        "x-api-key": key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    timeout=30.0,
                 )
 
             elif AI_PROVIDER == "openrouter":
                 key = self.api_key or os.getenv("OPENROUTER_API_KEY")
                 if not key:
                     raise ValueError("OPENROUTER_API_KEY is missing in your .env file.")
-                self._client = OpenAI(
+                self._client = httpx.Client(
                     base_url="https://openrouter.ai/api/v1",
-                    api_key=key,
-                    timeout=30.0
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=30.0,
                 )
 
             else:
@@ -163,10 +172,7 @@ class StoryClassifier:
             conn.close()
 
     def get_recent_titles(self, exclude_id: int, limit: int = 8) -> List[str]:
-        """
-        Fetches recent already-classified headlines from the past 7 days.
-        Uses sc.classified_at (ISO-8601) because RSS published_date formats vary.
-        """
+        """Fetches recent already-classified headlines from the past 7 days."""
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         try:
@@ -195,16 +201,12 @@ class StoryClassifier:
         clean_text: str,
         recent_titles: Optional[List[str]] = None,
     ) -> StoryClassification:
-        """
-        Calls the LLM with structured Pydantic output to classify one story.
-        Disables thinking tokens for speed and falls back to flash-lite if 503 busy.
-        """
+        """Calls the LLM with structured Pydantic output to classify one story."""
         recent_block = (
             "\n".join(f"- {t}" for t in recent_titles[:8])
             if recent_titles
             else "None"
         )
-        # First 1,500 chars (~250 words) contain the lead and key financial facts
         body_snippet = (clean_text or "")[:1500]
         prompt = (
             f"RECENT HEADLINES (last 7 days):\n{recent_block}\n\n"
@@ -219,6 +221,7 @@ class StoryClassifier:
         for attempt in range(max_retries):
             try:
                 if AI_PROVIDER == "gemini":
+                    from google.genai import types
                     response = self.client.models.generate_content(
                         model=GEMINI_MODEL,
                         contents=prompt,
@@ -227,7 +230,7 @@ class StoryClassifier:
                             response_mime_type="application/json",
                             response_schema=StoryClassification,
                             temperature=0.0,
-                            thinking_config=types.ThinkingConfig(thinking_budget=0)
+                            thinking_config=types.ThinkingConfig(thinking_budget=0),
                         ),
                     )
                     if response.parsed and isinstance(response.parsed, StoryClassification):
@@ -235,72 +238,55 @@ class StoryClassifier:
                     raw_text = response.text
 
                 elif AI_PROVIDER == "anthropic":
-                    message = self.client.messages.create(
-                        model=ANTHROPIC_MODEL,
-                        max_tokens=600,
-                        system=SYSTEM_PROMPT,
-                        messages=[{"role":"user", "content":prompt}],
-                        temperature=0.0
+                    resp = self.client.post(
+                        "/messages",
+                        json={
+                            "model": ANTHROPIC_MODEL,
+                            "max_tokens": 600,
+                            "system": SYSTEM_PROMPT,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.0,
+                        },
                     )
-                    raw_text = message.content[0].text
-
+                    resp.raise_for_status()
+                    raw_text = resp.json()["content"][0]["text"]
 
                 elif AI_PROVIDER == "openrouter":
                     schema = StoryClassification.model_json_schema()
-                    response = self.client.chat.completions.create(
-                        model=OPENROUTER_MODEL,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": f"""
-                                    {SYSTEM_PROMPT}
-                                    You MUST return a JSON object containing ALL of these fields:
-                                    1. sector
-                                    2. sentiment_score
-                                    3. importance
-                                    4. is_new
-                                    5. confidence
-                                    6. reasoning
-                                    7. counter_argument
-                                    Do not omit any field.
-                                    The JSON must conform to this schema:
-                                    {schema}
-                                    Example of the required structure:
-                                    {{
-                                        "sector": "Banks",
-                                        "sentiment_score": 0.50,
-                                        "importance": "moderate",
-                                        "is_new": true,
-                                        "confidence": "HIGH",
-                                        "reasoning": "The story directly affects banking sector conditions.",
-                                        "counter_argument": "The impact may be limited if the change is temporary."
-                                    }}
-                                    Return ONLY the JSON object.
-                                    Do not include markdown.
-                                    Do not include ```json.
-                                    Do not include explanations outside the JSON.
-                                    """
-                            },
-                            {
-                                "role": "user",
-                                "content": prompt
-                            }
-                        ],
-                        temperature=0.0,
-                        response_format={"type": "json_object"},
+                    resp = self.client.post(
+                        "/chat/completions",
+                        json={
+                            "model": OPENROUTER_MODEL,
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        f"{SYSTEM_PROMPT}\n"
+                                        "You MUST return a JSON object containing ALL of these fields:\n"
+                                        "1. sector\n2. sentiment_score\n3. importance\n4. is_new\n"
+                                        "5. confidence\n6. reasoning\n7. counter_argument\n"
+                                        f"Do not omit any field. The JSON must conform to this schema:\n{schema}\n"
+                                        "Return ONLY the JSON object. Do not include markdown or ```json."
+                                    ),
+                                },
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": 0.0,
+                            "response_format": {"type": "json_object"},
+                        },
                     )
-                    raw_text = response.choices[0].message.content
-
-                    # print("\n================ RAW OPENROUTER RESPONSE ================")
-                    # print(raw_text)
-                    # print("==========================================================\n")
+                    resp.raise_for_status()
+                    raw_text = resp.json()["choices"][0]["message"]["content"]
 
                 else:
                     raise ValueError(f"Unknown AI_PROVIDER : {AI_PROVIDER}")
 
-                print(f"{AI_PROVIDER} classification response received")
+                # Strip markdown fences if the model wrapped the JSON
+                cleaned_json = raw_text.strip()
+                if cleaned_json.startswith("```"):
+                    cleaned_json = cleaned_json.strip("`").removeprefix("json").strip()
 
-                return StoryClassification.model_validate_json(raw_text)
+                return StoryClassification.model_validate(json.loads(cleaned_json))
 
             except Exception as e:
                 error_str = str(e).upper()
@@ -394,7 +380,6 @@ class StoryClassifier:
                 })
                 progress.advance(task)
 
-                # Small pause between live API calls to respect free-tier RPM limits
                 if show_output and idx < len(pending) - 1 and self.request_delay > 0:
                     time.sleep(self.request_delay)
 

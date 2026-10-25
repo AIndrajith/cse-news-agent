@@ -10,11 +10,13 @@ import sqlite3
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "cse.db"
 
 SCHEMA = """
--- Daily overall market metrics from dailyMarketSummery
+-- Daily overall market metrics from market summaries and indicators
 CREATE TABLE IF NOT EXISTS daily_market (
     trade_date TEXT PRIMARY KEY,
     aspi REAL,
+    aspi_change REAL,
     snp_sl20 REAL,
+    snp_change REAL,
     market_turnover REAL,
     market_cap REAL,
     companies_traded INTEGER,
