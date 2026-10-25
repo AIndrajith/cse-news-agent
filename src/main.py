@@ -4,6 +4,7 @@ Exposes endpoints for running the agent, fetching sector scores, top stories,
 search filters, and accessing historical Markdown briefs, with modular CORS enabled.
 """
 
+import utils.session
 from datetime import datetime, timezone, timedelta
 import logging
 from pathlib import Path
